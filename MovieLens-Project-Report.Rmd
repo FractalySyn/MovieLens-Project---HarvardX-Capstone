@@ -1,0 +1,382 @@
+---
+title: "MovieLens Project - Report"
+output: pdf_document
+author: "Corentin Lobet"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+rm(list = ls())
+libs = c("MASS", "ggplot2", "imager", "broom", "caret", "dslabs", 
+         "matrixStats", "purrr", "rpart", "randomForest", "lubridate",
+         "tidyverse")
+lapply(libs, library, character.only = TRUE)
+options(digits = 5)
+seed = function(x) set.seed(x, sample.kind = "Rounding")
+```
+
+# 1. Introduction
+
+## Goal of this research
+
+This work is the first project of the final examination required to achieve the HarvardX Data Science Program. Analyses are performed on the MovieLens dataset as the goal is to compute a well performing recommendation movie system. The machine learning models used here are linear models predicting ratings based on the measurement of biases. We measure the performance of our models with the RMSE.
+
+## The MovieLens Data
+
+We used a subpart of the MovieLens data containing 10 millions observations. This data can be downloaded here :
+
+* [MovieLens 10M dataset](https://grouplens.org/datasets/movielens/10m/)
+* [MovieLens 10M dataset - zip file](http://files.grouplens.org/datasets/movielens/ml-10m.zip)
+
+```{r, include=FALSE}
+load("data/edx.RData")
+load("data/validation.RData")
+   
+if (!exists("edx")) 
+{
+   library(data.table)
+   dl = tempfile()
+   download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+   
+   ratings = fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                   col.names = c("userId", "movieId", "rating", "timestamp"))
+   movies = str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+   colnames(movies) = c("movieId", "title", "genres")
+   movies = as.data.frame(movies) %>%
+      mutate(movieId = as.numeric(movieId))
+   
+   movielens = left_join(ratings, movies, by = "movieId")
+   
+   seed(1)
+   test_index = createDataPartition(y = movielens$rating, p = 0.1, list = F)
+   edx = movielens[-test_index, ]; temp = movielens[test_index, ]
+   validation = temp %>%
+      semi_join(edx, by = "movieId") %>%
+      semi_join(edx, by = "userId")
+   
+   removed = anti_join(temp, validation)
+   edx = rbind(edx, removed)
+   rm(ratings, movies, test_index, temp, movielens, removed)
+   
+   save(edx, file = "edx.RData")
+   save(validation, file = "validation.RData")
+}
+
+```
+
+We will work on 90% of this data for most of the analyses in order to keep away 10% of the data as a validation set for our models.
+
+# 2. Analysis
+
+## Description of the data variables
+
+In our analysis we use the ratings given by users as the outcome to predict. We use three variables as predictors :
+
+* movieId : an ID number unique to each movie
+* userId : an ID number given to each user
+* genres : genre associated to the movie
+
+The data also include the titles and the date and time (as timestamp) the rating was given.
+
+```{r, echo=FALSE}
+head(edx) %>% knitr::kable(align = "c")
+```
+
+
+## Exploratory Data Analysis
+
+The original 10M dataset is already cleaned from Non Assigned values
+
+```{r, include=FALSE}
+edx %>% as.matrix() %>%
+   apply(2, function(x) sum(is.na(x)))
+validation %>% as.matrix() %>%
+   apply(2, function(x) sum(is.na(x)))
+```
+
+Ratings go from 0.5 to 5 with a step of 0.5 (but will be considered as continuous for predictions) and are given by nearly 70,000 users on over 10,000 movies.
+
+```{r, echo=FALSE}
+rbind(edx, validation) %>%
+   summarise(n_users = n_distinct(userId),
+             n_movies = n_distinct(movieId),
+             min_rating = min(rating),
+             max_rating = max(rating), .groups = "keep") %>%
+   knitr::kable(align = "c")
+```
+
+The ratings distribution looks like this :
+
+```{r, echo=FALSE}
+edx %>% ggplot(aes(rating)) + 
+  geom_histogram(binwidth = 0.5, color="black", fill="red", alpha = 0.5) + 
+  ggtitle("Distribution of ratings") +
+  ggthemes::theme_economist_white()
+```
+
+We can see that most of the ratings are above 2.5. Another striking fact is the affinity for round numbers (nearly 80%). Indeed all the picks we observe appear at whole numbers from 1 to 5. 
+
+```{r, include=FALSE}
+whole_number = function(x) 
+{
+   round(x, 0) == x
+}
+mean(whole_number(edx$rating))
+```
+
+In order to reduce our analyses' computation time we will start from now to work on a subset of 11% of our data. This lets us 1,000,000 ratings at our disposal which remains a very fair amount to conduct analyses and train models.
+
+```{r, include=FALSE}
+seed(10)
+ind = createDataPartition(edx$rating, p = 0.112, list = F)
+edx_small = edx[ind,]   
+```
+
+# 3. Model fitting and results
+
+## Model picking
+
+In order to build recommandation systems we first need to split our data in training and testing sets. We therefore make a 80/20 split which results in 800,000 observations for training and 200,000 for testing.
+
+```{r, include=FALSE}
+seed(20)
+index = createDataPartition(edx_small$rating, p = 0.2, list = F)
+train_set = edx_small[-index,]; test_set = edx_small[index,]
+
+test_set = test_set %>%
+   semi_join(train_set, by = "movieId") %>%
+   semi_join(train_set, by = "userId")
+```
+
+To build our model we start from the basic idea of predicting the same rating for all movies. In this case the forecasted rating would be the average among all ratings we have at our disposal. As we can expect, such a naive model isn't accurate at all. Indeed it leads to an RMSE above 1 which means that on average our predictions diverge by more than one point from the actual ratings. Our goal then is to reduce substantially this divergence.
+
+```{r, echo=FALSE}
+RMSE = function(true, estimate) {
+   sqrt(mean((true - estimate)^2))
+}
+mu = train_set$rating %>% mean()
+Results = RMSE(test_set$rating, mu) %>%
+   data.frame(Model = c("Model 0 : Overall Average Rating"),
+              RMSE = .) 
+Results %>% knitr::kable(align = "c")
+```
+
+To improve our model we will incorporate what we call biases. For several societal and behavioral reasons, some movies are generally better rated than others while users are more or less critical. As well we have to take into account that users may have preferences for some movie genres. 
+
+The following charts quantify these biases and reveal that these are substantial. 
+
+* The movie effect is mostly negative.
+* The user effect is more heterogeneous
+* The genre effect is less important and won't improve the model much
+
+```{r, echo=FALSE}
+train_set %>%
+   group_by(movieId) %>%
+   summarise(bias = mean(rating - mu), .groups = "keep") %>%
+   ggplot(aes(bias)) +
+   geom_histogram(bins = 20, color="black", fill="orange", alpha = 0.5) +
+   ggtitle("Movie bias from the average") +
+   ggthemes::theme_economist_white()
+
+train_set %>%
+   group_by(movieId) %>%
+   mutate(bi = mean(rating - mu)) %>%
+   ungroup() %>%
+   group_by(userId) %>%
+   summarise(bias = mean(rating - mu - bi), .groups = "keep") %>%
+   ggplot(aes(bias)) +
+   geom_histogram(bins = 20, color="black", fill="blue", alpha = 0.5) +
+   ggtitle("User bias from the average") +
+   ggthemes::theme_economist_white()
+
+train_set %>%
+   group_by(movieId) %>%
+   mutate(bi = mean(rating - mu)) %>%
+   ungroup() %>%
+   group_by(userId) %>%
+   mutate(bu = mean(rating - mu - bi)) %>%
+   ungroup() %>%
+   group_by(genres) %>%
+   summarise(bias = mean(rating - mu - bi - bu), .groups = "keep") %>%
+   ggplot(aes(bias)) +
+   geom_histogram(bins = 20, color="black", fill="green", alpha = 0.5) +
+   ggtitle("Genres bias from the average") +
+   ggthemes::theme_economist_white()
+```
+
+The next table presents the results of these models :
+
+```{r, echo=FALSE}
+movie_bias = train_set %>%
+   group_by(movieId) %>%
+   summarise(bi = mean(rating - mu), .groups = "keep")
+
+user_bias = train_set %>%
+   left_join(movie_bias, by = 'movieId') %>% 
+   group_by(userId) %>%
+   summarise(bu = mean(rating - mu - bi), .groups = "keep")
+
+genre_bias = train_set %>%
+   left_join(movie_bias, by = "movieId") %>%
+   left_join(user_bias, by = "userId") %>%
+   group_by(genres) %>%
+   summarise(bg = mean(rating - mu - bi - bu), .groups = "keep")
+
+r_hat_m = mu + test_set %>%
+   left_join(movie_bias, by = "movieId") %>%
+   .$bi
+Results = rbind(Results, 
+                c("Model 1 : LM with movie bias",
+                  RMSE(test_set$rating, r_hat_m)))
+
+r_hat_mb = mu + test_set %>%
+   left_join(movie_bias, by = "movieId") %>%
+   left_join(user_bias, by = "userId") %>%
+   mutate(bias = bu + bi) %>%
+   .$bias
+Results = rbind(Results, 
+                c("Model 2 : Model 1 + user bias", 
+                  RMSE(test_set$rating, r_hat_mb)))
+
+r_hat_mbg = mu + test_set %>%
+   left_join(movie_bias, by = "movieId") %>%
+   left_join(user_bias, by = "userId") %>%
+   left_join(genre_bias, by = "genres") %>%
+   mutate(bias = bu + bi + bg) %>%
+   .$bias
+Results = rbind(Results, 
+                c("Model 3 : Model 2 + genre bias",
+                  RMSE(test_set$rating, r_hat_mbg)))
+
+Results$RMSE = round(Results$RMSE %>% as.numeric(), 5)
+Results %>%
+   knitr::kable(align = "c")
+
+```
+
+
+Although these models improve the performance of our predictions they present a critical weakness. The highest estimated ratings are attributed to unpopular movies since we don't have much ratings to predict an accurate estimate. This pattern also happens in the worst estimates. 
+Therefore we need to shrink the lowest and highest estimates so that these unpopular movies converge to the average of similar movies.
+
+To achieve such a correction we use a penalized linear model. Instead of calculating a basic average of the biases, we add a fixed penalty term to the number of ratings per movies to the denominator term of the average formula. As a result this penalty term won't affect much movies that have a large amount of ratings while it will strongly shrink unpopular movie ratings.
+
+We repeat the same approach for the user and the genre bias. 
+The penalty terms were tuned on the training set and we found 2.2 for movies, 5.3 for users and 1.7 for genres.
+\pagebreak
+
+```{r, echo=FALSE}
+movie_reg = train_set %>%
+   group_by(movieId) %>%
+   summarise(bi = sum(rating - mu) / (n() + 2.2), .groups = "keep")
+
+r_reg_m = mu + test_set %>%
+   left_join(movie_reg, by = "movieId") %>%
+   .$bi
+Results = rbind(Results, 
+                c("Model 4 : Regularized Model 1",
+                  RMSE(test_set$rating, r_reg_m)))
+
+user_reg = train_set %>%
+   left_join(movie_reg, by = "movieId") %>%
+   group_by(userId) %>%
+   summarise(bu = sum(rating - mu - bi) / (n() + 5.3), .groups = "keep")
+
+r_reg_m_u = (mu + test_set %>%
+                left_join(movie_reg, by = "movieId") %>%
+                left_join(user_reg, by = "userId") %>%
+                mutate(bias = bi + bu) %>%
+                .$bias)
+Results = rbind(Results, 
+                c("Model 5 : Regularized Model 2",
+                  RMSE(test_set$rating, r_reg_m_u)))
+
+genre_reg = train_set %>%
+   left_join(movie_reg, by = "movieId") %>%
+   left_join(user_reg, by = "userId") %>%
+   group_by(genres) %>%
+   summarise(bg = sum(rating - mu - bi - bu) / (n() + 1.7), .groups = "keep")
+
+r_reg_all = (mu + test_set %>%
+                left_join(movie_reg, by = "movieId") %>%
+                left_join(user_reg, by = "userId") %>%
+                left_join(genre_reg, by = "genres") %>%
+                mutate(bias = bi + bu + bg) %>%
+                .$bias)
+Results = rbind(Results, 
+                c("Model 6 : Regularized Model 3",
+                  RMSE(test_set$rating, r_reg_all))) 
+
+Results$RMSE = round(Results$RMSE %>% as.numeric(), 5)
+Results %>%
+   knitr::kable(align = "c")
+```
+
+Now that we have our final model we are ready to test it on the validation set
+
+## Final test on the validation set
+
+We get a final RMSE of 0.86368 on the validation set which represents a 18.6% improvement from what we got with a naive model on the training set (Model 0).
+
+```{r, echo=FALSE}
+validation = validation %>%
+   semi_join(train_set, by = "movieId") %>%
+   semi_join(train_set, by = "userId")
+
+mu = mean(edx$rating)
+
+bi = edx %>%
+   group_by(movieId) %>%
+   summarise(bi = sum(rating - mu) / (n() + 2.2), .groups = "keep")
+
+bu = edx %>%
+   left_join(bi, by = "movieId") %>%
+   group_by(userId) %>%
+   summarise(bu = sum(rating - bi - mu) / (n() + 5.3), .groups = "keep")
+
+bg = edx %>%
+   left_join(bi, by = "movieId") %>%
+   left_join(bu, by = "userId") %>%
+   group_by(genres) %>%
+   summarise(bg = sum(rating - mu - bi - bu) / (n() + 1.7), .groups = "keep")
+
+r_hat = mu + validation %>%
+   left_join(bi, by = "movieId") %>%
+   left_join(bu, by = "userId") %>%
+   left_join(bg, by = "genres") %>%
+   mutate(bias = bi + bu + bg) %>%
+   .$bias
+
+Results = Results %>%
+   rbind(c("Final Model performance",
+           RMSE(validation$rating, r_hat)))
+Results$RMSE = round(as.numeric(Results$RMSE), 5)
+
+Results %>% knitr::kable(align = "c")
+```
+
+# 4. Conclusion
+
+Our analysis showed that movie and user biases are really important to take into consideration in the model in order to improve our recommendations performance. The genre effect is negligible.
+
+However an RMSE of 0.86368 remains high as it means that on a five rating scale we are on average 0.86 points away from the actual rating. This translates a very low accuracy.
+
+There exist better models today like the Slope One Model that reduces the RMSE to nearly 0.2. 
+
+We can note that working on such large data sets is somewhat complicated since it requires high requirements, especially of RAM, in order to compute on all the data. That's why we splitted the data.
+However it is possible to operate dimensionality reduction techniques and work on more data. Such pre-processing methods are good if the data is appropriate i.e. we don't loe much information doing so.
+
+
+
+
+
+
+
+
+
+
+
+
+
